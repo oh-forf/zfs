@@ -3874,10 +3874,28 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc,
 	int		cnt = 0;
 	struct address_space *mapping;
 
-	if ((err = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
+	if ((err = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0) {
+		unlock_page(pp);
 		return (err);
+	}
 
 	ASSERT(PageLocked(pp));
+
+	/*
+	 * A page which is not up to date has nothing to write.  zfs_rezget()
+	 * makes pages that way which it could not remove because we held
+	 * their lock while we waited for the teardown lock; they still have
+	 * the contents from before the filesystem was suspended.
+	 */
+	if (unlikely(!PageUptodate(pp))) {
+		if (!zfs_page_cache_remove(ip->i_mapping, pp))
+			(void) clear_page_dirty_for_io(pp);
+		zfs_dbgmsg("zfs_putpage: dropped a stale page of object %llu",
+		    (u_longlong_t)zp->z_id);
+		unlock_page(pp);
+		zfs_exit(zfsvfs, FTAG);
+		return (0);
+	}
 
 	pgoff = page_offset(pp);	/* Page byte-offset in file */
 	offset = i_size_read(ip);	/* File length in bytes */
