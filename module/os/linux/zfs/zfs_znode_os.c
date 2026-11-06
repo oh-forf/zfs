@@ -1193,6 +1193,138 @@ again:
 	return (err);
 }
 
+/*
+ * Number of consecutive passes without progress after which
+ * zfs_rezget_drop_pages() gives up on the pages it cannot drop, and an upper
+ * bound for the number of passes.
+ */
+#define	ZFS_REZGET_DROP_STALLS	3
+#define	ZFS_REZGET_DROP_PASSES	64
+
+/*
+ * Remove one page from the page cache, whether it is clean or dirty and
+ * whatever else holds a reference to it.  Returns B_TRUE if it was removed.
+ *
+ * The page is only trylocked, and a page under writeback is waited for before
+ * that and without the lock: writeback completes without z_teardown_lock.
+ */
+static boolean_t
+zfs_rezget_drop_page(struct address_space *mapping, struct page *pp)
+{
+	boolean_t dropped = B_FALSE;
+
+	if (PageWriteback(pp)) {
+#ifdef HAVE_PAGEMAP_FOLIO_WAIT_BIT
+		folio_wait_bit(page_folio(pp), PG_writeback);
+#else
+		wait_on_page_bit(pp, PG_writeback);
+#endif
+	}
+
+	if (!trylock_page(pp))
+		return (B_FALSE);
+
+	/* Writeback can only start while the page is locked. */
+	if (pp->mapping == mapping && !PageWriteback(pp)) {
+#ifdef HAVE_GENERIC_ERROR_REMOVE_FOLIO
+		dropped = (generic_error_remove_folio(mapping,
+		    page_folio(pp)) == 0);
+#else
+		dropped = (generic_error_remove_page(mapping, pp) == 0);
+#endif
+	}
+	unlock_page(pp);
+
+	return (dropped);
+}
+
+/* Try to remove all pages of a mapping; returns the number removed. */
+static unsigned long
+zfs_rezget_drop_cached(struct address_space *mapping)
+{
+	unsigned long dropped = 0;
+	pgoff_t start = 0;
+	unsigned int i, n;
+
+#ifdef HAVE_FILEMAP_GET_FOLIOS
+	struct folio_batch fbatch;
+
+	folio_batch_init(&fbatch);
+	while (filemap_get_folios(mapping, &start, (pgoff_t)-1, &fbatch) != 0) {
+		n = folio_batch_count(&fbatch);
+		for (i = 0; i < n; i++) {
+			if (zfs_rezget_drop_page(mapping,
+			    &fbatch.folios[i]->page))
+				dropped++;
+		}
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+#else
+	struct page *pages[16];
+
+	while ((n = find_get_pages_range(mapping, &start, (pgoff_t)-1,
+	    ARRAY_SIZE(pages), pages)) != 0) {
+		for (i = 0; i < n; i++) {
+			if (zfs_rezget_drop_page(mapping, pages[i]))
+				dropped++;
+			put_page(pages[i]);
+		}
+		cond_resched();
+	}
+#endif
+
+	return (dropped);
+}
+
+/*
+ * Drop the cached pages of a znode while the filesystem is suspended.
+ *
+ * zfs_resume_fs() calls zfs_rezget() with z_teardown_lock held as writer.
+ * A thread that is faulting a page in (zfs_getpage()) or writing one back
+ * (zfs_putpage()) holds that page's lock while it waits in zfs_enter() for
+ * the teardown lock, so truncate_inode_pages() would wait for the page lock
+ * forever.  Only drop pages which can be dropped without sleeping on a page
+ * lock, like truncate_inode_pages() does otherwise.  This is not done by
+ * invalidate_mapping_pages(), which also skips dirty pages and pages which
+ * have an extra reference, for example from a per-CPU LRU batch, and these
+ * would stay stale.  Mappings are removed first.  A private copy-on-write
+ * page is not part of the page cache and stays, as it does with
+ * truncate_inode_pages().
+ *
+ * Pages which could not be dropped:
+ *  - A page which is not yet up to date is filled by zfs_getpage() once the
+ *    filesystem has been resumed, from the new data.
+ *  - A page which is locked for another short reason is retried a few times.
+ *  - A dirty page which a zfs_putpage() caller has locked, while it waits
+ *    for the teardown lock, is written back after the resume.  That is the
+ *    one case which still behaves as if the page cache was not dropped.
+ */
+static void
+zfs_rezget_drop_pages(struct inode *ip)
+{
+	struct address_space *mapping = ip->i_mapping;
+	int stalls = 0;
+	int passes = 0;
+
+	while (mapping->nrpages != 0 && stalls < ZFS_REZGET_DROP_STALLS &&
+	    passes++ < ZFS_REZGET_DROP_PASSES) {
+		unmap_mapping_range(mapping, 0, 0, 0);
+
+		if (zfs_rezget_drop_cached(mapping) != 0) {
+			stalls = 0;
+		} else {
+			stalls++;
+			delay(1);
+		}
+	}
+
+	if (mapping->nrpages != 0)
+		zfs_dbgmsg("zfs_rezget: %lu pages of object %llu left in "
+		    "the page cache", mapping->nrpages,
+		    (u_longlong_t)ITOZ(ip)->z_id);
+}
+
 int
 zfs_rezget(znode_t *zp)
 {
@@ -1226,10 +1358,12 @@ zfs_rezget(znode_t *zp)
 	 * Drop cached pages before reloading the znode.  After a rollback or
 	 * a forced receive the object may hold different data under the same
 	 * inode, size and generation; stale Uptodate pages would otherwise be
-	 * served by mappedread() and mmap() (see #10931).  FreeBSD does the
-	 * same here via vn_pages_remove().
+	 * served by mappedread() and mmap() (see #10931).  Unlike
+	 * vn_pages_remove() on FreeBSD, this cannot wait for pages which are
+	 * locked by a thread that is blocked on the teardown lock; see
+	 * zfs_rezget_drop_pages().
 	 */
-	truncate_inode_pages(ZTOI(zp)->i_mapping, 0);
+	zfs_rezget_drop_pages(ZTOI(zp));
 
 	zh = zfs_znode_hold_enter(zfsvfs, obj_num);
 
